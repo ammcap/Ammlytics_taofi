@@ -11,12 +11,25 @@ const YOUR_WALLET = '0xD8aB8a077b02670aae04bcdBeF15CAFEA0fB50c9';
 const DEC0 = 18;  // WTAO decimals
 const DEC1 = 6;   // USDC decimals
 
-// Full UniswapV3Pool ABI (trimmed as before)
+// Full UniswapV3Pool ABI (from your JSON; events and constructor omitted for script size)
 const POOL_ABI = [
-  'function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)',
-  'function liquidity() view returns (uint128)',
+  'function factory() view returns (address)',
   'function fee() view returns (uint24)',
-  'function tickSpacing() view returns (int24)'
+  'function feeGrowthGlobal0X128() view returns (uint256)',
+  'function feeGrowthGlobal1X128() view returns (uint256)',
+  'function liquidity() view returns (uint128)',
+  'function maxLiquidityPerTick() view returns (uint128)',
+  'function observations(uint256) view returns (uint32 blockTimestamp, int56 tickCumulative, uint160 secondsPerLiquidityCumulativeX128, bool initialized)',
+  'function observe(uint32[] secondsAgos) view returns (int56[] tickCumulatives, uint160[] secondsPerLiquidityCumulativeX128s)',
+  'function positions(bytes32) view returns (uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128, uint128 tokensOwed0, uint128 tokensOwed1)',
+  'function protocolFees() view returns (uint128 token0, uint128 token1)',
+  'function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)',
+  'function snapshotCumulativesInside(int24 tickLower, int24 tickUpper) view returns (int56 tickCumulativeInside, uint160 secondsPerLiquidityInsideX128, uint32 secondsInside)',
+  'function tickBitmap(int16) view returns (uint256)',
+  'function tickSpacing() view returns (int24)',
+  'function ticks(int24) view returns (uint128 liquidityGross, int128 liquidityNet, uint256 feeGrowthOutside0X128, uint256 feeGrowthOutside1X128, int56 tickCumulativeOutside, uint160 secondsPerLiquidityOutsideX128, uint32 secondsOutside, bool initialized)',
+  'function token0() view returns (address)',
+  'function token1() view returns (address)'
 ];
 
 // Positions ABI (as before)
@@ -28,10 +41,12 @@ const POSITIONS_ABI = [
 
 // TickMath with full constants from Uniswap V3 TickMath.sol
 const Q96 = 2n ** 96n;
+
 class TickMath {
   static getSqrtRatioAtTick(tick) {
     let absTick = Math.abs(tick);
     let ratio = (absTick & 1) !== 0 ? 0xfffcb933bd6fad37aa2d162d1a594001n : 0x100000000000000000000000000000000n;
+    
     if ((absTick & 0x2) !== 0) ratio = (ratio * 0xfff97272373d413259a46990580e213an) >> 128n;
     if ((absTick & 0x4) !== 0) ratio = (ratio * 0xfff2e50f5f656932ef12357cf3c7fdccn) >> 128n;
     if ((absTick & 0x8) !== 0) ratio = (ratio * 0xffe5caca7e10e4e61c3624eaa0941cd0n) >> 128n;
@@ -53,11 +68,11 @@ class TickMath {
     if ((absTick & 0x80000) !== 0) ratio = (ratio * 0x48a170391f7dc42444e8fa2n) >> 128n;
 
     if (tick > 0) ratio = (2n ** 256n - 1n) / ratio;
-
+    
     // Round to nearest
     let sqrtRatioX96 = ratio >> 32n;
     if (ratio % (2n ** 32n) !== 0n) sqrtRatioX96 += 1n;
-
+    
     return sqrtRatioX96;
   }
 }
@@ -81,10 +96,10 @@ function getAmount1ForLiquidity(sqrtRatioAX96, sqrtRatioBX96, liquidity) {
 
 function getAmountsForLiquidity(sqrtRatioX96, sqrtRatioAX96, sqrtRatioBX96, liquidity) {
   if (sqrtRatioAX96 > sqrtRatioBX96) [sqrtRatioAX96, sqrtRatioBX96] = [sqrtRatioBX96, sqrtRatioAX96];
-
+  
   let amount0 = 0n;
   let amount1 = 0n;
-
+  
   if (sqrtRatioX96 <= sqrtRatioAX96) {
     amount0 = getAmount0ForLiquidity(sqrtRatioAX96, sqrtRatioBX96, liquidity);
   } else if (sqrtRatioX96 < sqrtRatioBX96) {
@@ -93,7 +108,7 @@ function getAmountsForLiquidity(sqrtRatioX96, sqrtRatioAX96, sqrtRatioBX96, liqu
   } else {
     amount1 = getAmount1ForLiquidity(sqrtRatioAX96, sqrtRatioBX96, liquidity);
   }
-
+  
   return { amount0, amount1 };
 }
 
@@ -113,53 +128,112 @@ function tickToPrice(tick) {
   return computePrice(sqrtRatioX96);
 }
 
+// New: Function to compute fee growth inside the range
+function getFeeGrowthInside(feeGrowthOutsideLower, feeGrowthOutsideUpper, feeGrowthGlobal, currentTick, tickLower, tickUpper) {
+  let feeGrowthBelow = 0n;
+  if (currentTick >= tickLower) {
+    feeGrowthBelow = feeGrowthOutsideLower;
+  } else {
+    feeGrowthBelow = feeGrowthGlobal - feeGrowthOutsideLower;
+  }
+  
+  let feeGrowthAbove = 0n;
+  if (currentTick < tickUpper) {
+    feeGrowthAbove = feeGrowthOutsideUpper;
+  } else {
+    feeGrowthAbove = feeGrowthGlobal - feeGrowthOutsideUpper;
+  }
+  
+  return feeGrowthGlobal - feeGrowthBelow - feeGrowthAbove;
+}
+
 async function getLPOverview() {
   try {
     const network = await provider.getNetwork();
     console.log(`Connected to chain: ${network.name} (ID: ${network.chainId})`);
-
+    
     // Get pool state
     const pool = new ethers.Contract(POOL_ADDRESS, POOL_ABI, provider);
     const slot0 = await pool.slot0();
     const currentTick = Number(slot0.tick);
     const sqrtPriceX96 = BigInt(slot0.sqrtPriceX96);
     const currentPrice = computePrice(sqrtPriceX96);
-
+    const feeGrowthGlobal0 = BigInt(await pool.feeGrowthGlobal0X128());
+    const feeGrowthGlobal1 = BigInt(await pool.feeGrowthGlobal1X128());
+    
     console.log(`\nPool Snapshot:`);
     console.log(`- Current Tick: ${currentTick}`);
     console.log(`- Current Price (USDC per WTAO): ≈$${currentPrice.toFixed(2)}`);
-
+    
     // Get positions
     const positionManager = new ethers.Contract(POSITIONS_ADDRESS, POSITIONS_ABI, provider);
     const balance = Number(await positionManager.balanceOf(YOUR_WALLET));
     console.log(`\nTotal Positions Found: ${balance}`);
+    
     let activeCount = 0;
-
     for (let i = 0; i < balance; i++) {
       const tokenIdBig = await positionManager.tokenOfOwnerByIndex(YOUR_WALLET, BigInt(i));
       const pos = await positionManager.positions(tokenIdBig);
-
+      
       if (pos.liquidity === 0n) continue;  // Skip inactive
-
       activeCount++;
+      
       const tickLower = Number(pos.tickLower);
       const tickUpper = Number(pos.tickUpper);
       const priceLower = tickToPrice(tickLower);
       const priceUpper = tickToPrice(tickUpper);
       const inRange = currentTick >= tickLower && currentTick < tickUpper;
-
-      const { amount0, amount1 } = getAmountsForLiquidity(sqrtPriceX96, TickMath.getSqrtRatioAtTick(tickLower), TickMath.getSqrtRatioAtTick(tickUpper), pos.liquidity);
-
+      
+      const { amount0, amount1 } = getAmountsForLiquidity(
+        sqrtPriceX96,
+        TickMath.getSqrtRatioAtTick(tickLower),
+        TickMath.getSqrtRatioAtTick(tickUpper),
+        pos.liquidity
+      );
+      
+      // Calculate unclaimed fees
+      const tickLowerInfo = await pool.ticks(BigInt(tickLower));
+      const tickUpperInfo = await pool.ticks(BigInt(tickUpper));
+      
+      const feeGrowthInside0 = getFeeGrowthInside(
+        BigInt(tickLowerInfo.feeGrowthOutside0X128),
+        BigInt(tickUpperInfo.feeGrowthOutside0X128),
+        feeGrowthGlobal0,
+        currentTick,
+        tickLower,
+        tickUpper
+      );
+      
+      const feeGrowthInside1 = getFeeGrowthInside(
+        BigInt(tickLowerInfo.feeGrowthOutside1X128),
+        BigInt(tickUpperInfo.feeGrowthOutside1X128),
+        feeGrowthGlobal1,
+        currentTick,
+        tickLower,
+        tickUpper
+      );
+      
+      const Q128 = 2n ** 128n;
+      const accrued0 = (pos.liquidity * (feeGrowthInside0 - BigInt(pos.feeGrowthInside0LastX128))) / Q128;
+      const accrued1 = (pos.liquidity * (feeGrowthInside1 - BigInt(pos.feeGrowthInside1LastX128))) / Q128;
+      
+      const unclaimed0 = accrued0 + BigInt(pos.tokensOwed0);
+      const unclaimed1 = accrued1 + BigInt(pos.tokensOwed1);
+      
+      const unclaimedWTAO = Number(ethers.formatUnits(unclaimed0, DEC0));
+      const unclaimedUSDC = Number(ethers.formatUnits(unclaimed1, DEC1));
+      const unclaimedUSD = (unclaimedWTAO * currentPrice) + unclaimedUSDC;
+      
       console.log(`\nActive Position #${activeCount} (Token ID: ${tokenIdBig.toString()}):`);
       console.log(`- Tick Range: ${tickLower} to ${tickUpper}`);
       console.log(`- Price Range (USDC per WTAO): ≈$${priceLower.toFixed(2)} to $${priceUpper.toFixed(2)}`);
       console.log(`- In Range: ${inRange ? 'Yes' : 'No'}`);
       console.log(`- Liquidity: ${pos.liquidity.toString()} (raw units)`);
       console.log(`- Locked Amounts: ${ethers.formatUnits(amount0, DEC0)} WTAO, ${ethers.formatUnits(amount1, DEC1)} USDC`);
-      console.log(`- Unclaimed Fees: ${ethers.formatUnits(pos.tokensOwed0, DEC0)} WTAO, ${ethers.formatUnits(pos.tokensOwed1, DEC1)} USDC`);
+      console.log(`- Unclaimed Fees: ${unclaimedWTAO.toFixed(6)} WTAO + ${unclaimedUSDC.toFixed(6)} USDC (≈$${unclaimedUSD.toFixed(2)} total)`);
       console.log(`- Fee Tier: ${Number(pos.fee) / 10000}%`);
     }
-
+    
     if (activeCount === 0) {
       console.log('No active positions (liquidity > 0) found.');
     }
