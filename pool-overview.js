@@ -9,9 +9,8 @@ const POOL_ADDRESS = '0x6647dcbeb030dc8E227D8B1A2Cb6A49F3C887E3c';
 const WTAO_ADDRESS = '0x9Dc08C6e2BF0F1eeD1E00670f80Df39145529F81';
 const USDC_ADDRESS = '0xB833E8137FEDf80de7E908dc6fea43a029142F20';
 
-// Minimal ERC20 ABI for symbol and decimals (unchanged)
+// Minimal ERC20 ABI for decimals (symbol removed as no longer needed here)
 const ERC20_ABI = [
-  'function symbol() view returns (string)',
   'function decimals() view returns (uint8)'
 ];
 
@@ -46,7 +45,7 @@ async function getPoolOverview() {
     const wtao = new ethers.Contract(WTAO_ADDRESS, ERC20_ABI, provider);
     const usdc = new ethers.Contract(USDC_ADDRESS, ERC20_ABI, provider);
 
-    // Get decimals (we'll use them for price calculation)
+    // Get decimals for price adjustment
     const dec0 = await wtao.decimals();  // WTAO: 18
     const dec1 = await usdc.decimals();  // USDC: 6
 
@@ -56,15 +55,19 @@ async function getPoolOverview() {
     const fee = await pool.fee();
     const tickSpacing = await pool.tickSpacing();
 
-    // Calculate price: USDC per WTAO (human-readable)
+    // Calculate price: USDC per WTAO (human-readable, with BigInt scaling for precision)
     const sqrtPriceX96 = BigInt(slot0.sqrtPriceX96);
-    const rawPrice = (sqrtPriceX96 * sqrtPriceX96) / (2n ** 192n);  // (sqrtPriceX96 / 2**96) ** 2 as BigInt
-    const priceAdjustment = 10n ** BigInt(Number(dec0) - Number(dec1));  // 10^(18-6) = 10^12
-    const price = Number(rawPrice * priceAdjustment) / 10 ** Number(dec1);  // Adjust to readable (divide by USDC decimals for display, but since it's already adjusted, tweak if needed)
+    const decDiff = Number(dec0) - Number(dec1);  // 12
+    const priceDecimals = 2;  // For toFixed(2)
+    const adjustment = 10n ** BigInt(decDiff + priceDecimals);  // 10^(12 + 2) = 10^14
+    const numerator = sqrtPriceX96 * sqrtPriceX96 * adjustment;
+    const denom = 2n ** 192n;
+    const scaledBig = numerator / denom;
+    const price = Number(scaledBig) / 10 ** priceDecimals;
 
     console.log('Pool Overview:');
     console.log(`- Current Tick: ${Number(slot0.tick)}`);
-    console.log(`- Liquidity: ${ethers.formatUnits(liquidity, 18)} (raw units)`);  // Liquidity is in sqrt units, but format for readability
+    console.log(`- Liquidity: ${liquidity} (raw units)`);
     console.log(`- Price (USDC per WTAO): ≈$${price.toFixed(2)}`);
     console.log(`- Fee: ${Number(fee) / 10000}%`);
     console.log(`- Tick Spacing: ${Number(tickSpacing)}`);
