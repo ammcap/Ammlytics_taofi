@@ -41,7 +41,6 @@ const POSITIONS_ABI = [
 
 // TickMath with full constants from Uniswap V3 TickMath.sol
 const Q96 = 2n ** 96n;
-
 class TickMath {
   static getSqrtRatioAtTick(tick) {
     let absTick = Math.abs(tick);
@@ -128,7 +127,7 @@ function tickToPrice(tick) {
   return computePrice(sqrtRatioX96);
 }
 
-// New: Function to compute fee growth inside the range
+// Function to compute fee growth inside the range
 function getFeeGrowthInside(feeGrowthOutsideLower, feeGrowthOutsideUpper, feeGrowthGlobal, currentTick, tickLower, tickUpper) {
   let feeGrowthBelow = 0n;
   if (currentTick >= tickLower) {
@@ -171,6 +170,7 @@ async function getLPOverview() {
     console.log(`\nTotal Positions Found: ${balance}`);
     
     let activeCount = 0;
+    let totalValueUSD = 0;
     for (let i = 0; i < balance; i++) {
       const tokenIdBig = await positionManager.tokenOfOwnerByIndex(YOUR_WALLET, BigInt(i));
       const pos = await positionManager.positions(tokenIdBig);
@@ -224,18 +224,27 @@ async function getLPOverview() {
       const unclaimedUSDC = Number(ethers.formatUnits(unclaimed1, DEC1));
       const unclaimedUSD = (unclaimedWTAO * currentPrice) + unclaimedUSDC;
       
+      // Calculate position value
+      const lockedWTAO = Number(ethers.formatUnits(amount0, DEC0));
+      const lockedUSDC = Number(ethers.formatUnits(amount1, DEC1));
+      const lockedUSD = (lockedWTAO * currentPrice) + lockedUSDC;
+      const positionValueUSD = lockedUSD + unclaimedUSD;
+      totalValueUSD += positionValueUSD;
+
       console.log(`\nActive Position #${activeCount} (Token ID: ${tokenIdBig.toString()}):`);
       console.log(`- Tick Range: ${tickLower} to ${tickUpper}`);
       console.log(`- Price Range (USDC per WTAO): ≈$${priceLower.toFixed(2)} to $${priceUpper.toFixed(2)}`);
       console.log(`- In Range: ${inRange ? 'Yes' : 'No'}`);
-      console.log(`- Liquidity: ${pos.liquidity.toString()} (raw units)`);
-      console.log(`- Locked Amounts: ${ethers.formatUnits(amount0, DEC0)} WTAO, ${ethers.formatUnits(amount1, DEC1)} USDC`);
+      console.log(`- Locked Amounts: ${lockedWTAO.toFixed(6)} WTAO (≈$${ (lockedWTAO * currentPrice).toFixed(2) }), ${lockedUSDC.toFixed(6)} USDC`);
       console.log(`- Unclaimed Fees: ${unclaimedWTAO.toFixed(6)} WTAO + ${unclaimedUSDC.toFixed(6)} USDC (≈$${unclaimedUSD.toFixed(2)} total)`);
+      console.log(`- Position Value: ≈$${positionValueUSD.toFixed(2)} USD`);
       console.log(`- Fee Tier: ${Number(pos.fee) / 10000}%`);
     }
     
     if (activeCount === 0) {
       console.log('No active positions (liquidity > 0) found.');
+    } else {
+      console.log(`\nTotal Value Across All Active Positions: ≈$${totalValueUSD.toFixed(2)} USD`);
     }
   } catch (error) {
     console.error('Error getting LP overview:', error.message);
